@@ -1,13 +1,16 @@
 # PMM Django Project WSL
 
-Django app for importing PMM CSV batches into DB and exporting Excel reports.
+Система учета топлива и расходных материалов.
 
-## Setup (WSL/Linux)
+## Функционал:
+- Загрузка CSV файлов
+- Импорт в базу данных
+- Админка Django
+- Экспорт Excel отчетов
+- Сводки по топливу и технике
 
-`bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python3 manage.py migrate
-python3 manage.py createsuperuser
-python3 manage.py runserver
+## Стек:
+Python, Django, SQLite, OpenPyXL
+
+## Запуск:
+python manage.py runserver
