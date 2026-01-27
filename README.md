@@ -1,16 +1,20 @@
-# PMM Django Project WSL
+# PMM Django Project
 
-Система учета топлива и расходных материалов.
+Учебный проект по импорту CSV и экспорту Excel отчётов.
 
-## Функционал:
-- Загрузка CSV файлов
-- Импорт в базу данных
-- Админка Django
-- Экспорт Excel отчетов
-- Сводки по топливу и технике
+## Функционал
+- Загрузка CSV файла
+- Импорт данных в базу
+- Просмотр через Django admin
+- Экспорт Excel отчётов
 
-## Стек:
-Python, Django, SQLite, OpenPyXL
+## Установка
 
-## Запуск:
+`bash
+git clone https://github.com/M1ronych/Project-PMM-Django.git
+cd Project-PMM-Django
+python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+python manage.py migrate
 python manage.py runserver
