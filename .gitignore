@@ -1,7 +1,22 @@
-db.sqlite3
-media/
+# Python
 pycache/
 *.pyc
+*.pyo
+*.pyd
+
+# Django
+db.sqlite3
+media/
+staticfiles/
+
+# Virtual env
+venv/
 .env
-.vscode/
+
+# IDE
 .idea/
+.vscode/
+
+# System
+.DS_Store
+Thumbs.db
