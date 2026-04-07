@@ -1,22 +1,24 @@
-# Python
-pycache/
+__pycache__/
 *.pyc
 *.pyo
 *.pyd
 
-# Django
-db.sqlite3
-media/
-staticfiles/
-
-# Virtual env
-venv/
 .env
+venv/
+.venv/
 
-# IDE
+db.sqlite3
+
+media/
+uploads/
+
+*.log
+
 .idea/
 .vscode/
 
-# System
 .DS_Store
-Thumbs.db
+
+# 🔥 мусорні nano-файлы
+*.save
+*.save.*
