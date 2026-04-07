@@ -21,22 +21,34 @@
     <button type="submit">Загрузить и импортировать</button>
   </form>
 
+ <form method="post" action="{% url 'clear_db' %}" style="margin-top: 15px;">
+    {% csrf_token %}
+    <button type="submit" onclick="return confirm('Ты точно хочешь удалить ВСЕ данные?')">
+        Очистить базу
+    </button>
+ </form>
+
   <p><a href="/export/">Скачать общий Excel отчёт</a></p>
 
   <p>После импорта смотри данные в <a href="/admin/">админке</a>.</p>
-</body>
-</html>
+
 
 <h2>Импорты</h2>
+
 {% if batches %}
-  <ul>
+<ul>
     {% for b in batches %}
-      <li>
-        Batch #{{ b.id }} — {{ b.source_filename }} — {{ b.created_at }}
-        [<a href="/export/?batch={{ b.id }}">Скачать Excel</a>]
-      </li>
+        <li>
+            Batch #{{ b.id }} — {{ b.source_filename }} — {{ b.created_at }}
+            [<a href="/export/?batch={{ b.id }}">Скачать Excel</a>]
+        </li>
     {% endfor %}
-  </ul>
+</ul>
 {% else %}
-  <p>Пока импортов нет.</p>
+<p>Пока импортов нет.</p>
 {% endif %}
+
+</body>
+</html>
+  
+

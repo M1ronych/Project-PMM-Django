@@ -1,0 +1,292 @@
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from io import StringIO
+
+import pandas as pd
+
+from django.core.management.base import BaseCommand, CommandError
+from django.db import transaction
+
+from pmm.models import Section, Fuel, Vehicle, ImportBatch, PmmRecord
+
+
+def to_decimal(x):
+    if pd.isna(x) or x == "" or str(x).lower() == "nan":
+        return None
+    try:
+        return Decimal(str(x))
+    except (InvalidOperation, ValueError):
+        return None
+
+def _read_bytes(path: str) -> bytes:
+    return Path(path).read_bytes()
+
+
+def _decode_1c_text(raw: bytes) -> str:
+    text = None
+    # Надійно: пробуемо кілька кодировок та перовіряемо, що це реально 1C-шапка
+    # Порядок важливий. Спочатку utf-8...
+    for enc in ("utf-8-sig", "utf-8", "cp1251", "windows-1251"):
+        t = raw.decode(enc,errors="replace")
+        low = t.lower()
+        if ("дебет" in low) and ("кредит" in low) and (("період" in low) or ("период" in low)):
+            text = t
+            break
+
+    if text is None:
+        # Якщо не знайшли ідеальний, пробуємо просто utf-8, а потім cp1251
+        try:
+            text = raw.decode("utf-8", errors="replace")
+        except Exception:
+            text = raw.decode("cp1251", errors="replace")
+
+    return text
+
+def _detect_source_type(csv_path: str) -> str:
+    raw = _read_bytes(csv_path)
+    text = _decode_1c_text(raw).lower()
+
+    print("\n===== DECODE CHECK START =====")
+    print(text[:500])
+    print("===== DECODE CHECK END =====\n")
+
+    # Якщо в тексті є ознаки 1C-звіту
+    if (("картка рахунку" in text) or ("карточка счета" in text)) and ("дебет" in text) and ("кредит" in text):
+        return "1C"
+    # Інакше пробуемо як PMM-таблицу
+    try:
+        text = raw.decode("cp1251", errors="replace")
+        df = pd.read_csv(StringIO(text), sep=",", engine="python")
+        cols = {str(c).strip().lower() for c in df.columns}
+        if {"section", "fuel", "vehicle"}.issubset(cols):
+            return "PMM"
+    except Exception:
+        pass
+    return "1C"
+
+def _read_1c_report_as_pmm_df(csv_path: str) -> pd.DataFrame:
+    raw = _read_bytes(csv_path)
+    text = _decode_1c_text(raw)
+    lines = text.splitlines()
+
+    # знайти строку заголовка таблиці
+    header_line = None
+    for i, line in enumerate(lines):
+        low = line.lower()
+        if ("період" in low or "период" in low) and ("дебет" in low) and ("кредит" in low):
+            header_line = i
+            break
+    if header_line is None:
+        raise ValueError("Не найдена строка заголовка 1C (Період/Дебет/Кредит).")
+
+    # вирізаемо таблицю починаючи з заголовку та читаемо pandas з StringIO
+    data_text = "\n".join(lines[header_line:])
+    df = pd.read_csv(StringIO(data_text), sep=";", engine="python", dtype=str)
+    df.columns = [str(c).strip().replace("\ufeff", "") for c in df.columns]
+
+    # знайти потрібні колонки “по вхожденню”
+    cols_l = [c.lower() for c in df.columns]
+
+    def find_col_contains(*needles):
+        for orig, low in zip(df.columns, cols_l):
+            for n in needles:
+                if n in low:
+                    return orig
+        return None
+
+    col_an_dt = find_col_contains("аналітика дт", "аналитика дт")
+    col_an_kt = find_col_contains("аналітика кт", "аналитика кт")
+    col_debit = find_col_contains("дебет")
+    col_credit = find_col_contains("кредит")
+
+    if (not col_debit) or (not col_credit):
+        raise ValueError(f"Не нашёл колонки Дебет/Кредит. Колонки: {list(df.columns)}")
+
+    #  мінімальна нормалізація под PMM-схему
+    def to_num(x):
+        if x is None:
+            return None
+        s = str(x).strip().replace(" ", "").replace("\xa0", "").replace(",", ".")
+        if s == "" or s.lower() == "nan":
+            return None
+        try:
+            return float(s)
+        except Exception:
+            return None
+
+    out = pd.DataFrame()
+    out["section"] = df[col_an_dt].astype(str).fillna("").str.strip() if col_an_dt else ""
+    out["fuel"] = df[col_an_kt].astype(str).fillna("").str.strip() if col_an_kt else ""
+    out["vehicle"] = ""  # поки пусто, потім покращу
+    out["fact_qty"] = None
+    out["fact_amount"] = df[col_debit].map(to_num)
+    out["plan_qty"] = None
+    out["plan_amount"] = None
+    out["price"] = None
+    out["delta"] = None
+
+    # прибрати сміття
+    out = out[(out["section"] != "") | (out["fuel"] != "")]
+    out = out[out["fact_amount"].fillna(0) != 0]
+
+    return out
+
+class Command(BaseCommand):
+    help = "Import PMM records from a prepared CSV (final_vehicle.csv)."
+
+    def add_arguments(self, parser):
+        parser.add_argument("csv_path", type=str, help="Path to CSV file, e.g. data_out/final_vehicle.csv")
+
+    @transaction.atomic
+    def handle(self, *args, **options):
+        csv_path = Path(options["csv_path"])
+        if not csv_path.exists():
+            raise CommandError(f"CSV not found: {csv_path}")
+
+        # Спочатку пробуємо як звичайну ПММ-таблицю
+            raw = Path(csv_path).read_bytes()
+
+        # з'ясовуємо тип джерела
+            source_type = "1C"
+            try:
+                # пробуємо як PMM (звичайний CSV)
+                df_probe = pd.read_csv(
+                    StringIO(raw.decode("utf-8-sig", errors="replace")),
+                    sep=",",
+                    engine="python",
+                )
+                cols = {str(c).strip().lower() for c in df_probe.columns}
+                if {"section", "fuel", "vehicle"}.issubset(cols):
+                    source_type = "PMM"
+            except Exception:
+                source_type = "1C"
+
+            # якщо  1C — читаемо як текст нормально (без “кракозябр”)
+            if source_type == "1C":
+                text = None
+                for enc in ("cp1251", "windows-1251", "utf-8-sig", "utf-8"):
+                    t = raw.decode(enc, errors="replace")
+                    low = t.lower()
+                    # ознаки, що це реально 1С-шапка
+                    if ("дебет" in low) and ("кредит" in low) and ("період" in low or "период" in low):
+                        text = t
+                        break
+
+                if text is None:
+                    # fallback
+                    text = raw.decode("cp1251", errors="replace")
+
+                lines = text.splitlines()
+
+                # шукаємо строку з заголовками
+                header_line = None
+                for i, line in enumerate(lines):
+                    low = line.lower()
+                    if "дебет" in low and "кредит" in low:
+                        header_line = i
+                        break
+
+                if header_line is None:
+                    raise CommandError("Не знайдена строка заголовків з Дебет/Кредит")
+
+                df = pd.read_csv(
+                    csv_path,
+                    sep=";",
+                    encoding="cp1251",
+                    engine="python",
+                    skiprows=header_line
+                )
+
+                df.columns = [str(c).strip() for c in df.columns]
+
+                col_debit = next((c for c in df.columns if "дебет" in c.lower()), None)
+                col_credit = next((c for c in df.columns if "кредит" in c.lower()), None)
+
+                if not col_debit or not col_credit:
+                    raise CommandError("Не знайдені колонки Дебет/Кредит після зчитання")
+
+                # тепер створюємо  ПММ-формат
+                df_out = pd.DataFrame()
+                df_out["section"] = "1C Імпорт"
+                df_out["fuel"] = "Зі звіту"
+                df_out["vehicle"] = "Загальний"
+                df_out["fact_qty"] = df[col_debit].fillna(0).astype(str).str.replace(",", ".").astype(float)
+                df_out["fact_amount"] = df[col_credit].fillna(0).astype(str).str.replace(",", ".").astype(float)
+                df_out["plan_qty"] = 0
+                df_out["plan_amount"] = 0
+                df_out["price"] = 0
+                df_out["delta"] = df_out["fact_amount"]
+
+                df = df_out
+        
+
+        required = {"section", "fuel", "vehicle", "fact_qty", "fact_amount", "plan_qty", "plan_amount", "price", "delta"}
+        missing = required - set(df.columns)
+        if missing:
+            raise CommandError(f"Missing columns in CSV: {sorted(missing)}")
+
+        batch = ImportBatch.objects.create(
+            source_filename=csv_path.name,
+            total_rows=len(df),
+        )
+
+        imported = 0
+        errors = 0
+
+        # Кеш, щоб  не довбати  БД кожен рядок
+        section_cache = {}
+        fuel_cache = {}
+        vehicle_cache = {}
+
+        records = []
+
+        for i, row in df.iterrows():
+            try:
+                section_name = row.get("section")
+                if pd.isna(section_name) or str(section_name).lower() in ("nan", "none", ""):
+                    section_obj = None
+                else:
+                    section_name = str(section_name).strip()
+                    section_obj = section_cache.get(section_name)
+                    if section_obj is None:
+                        section_obj, _ = Section.objects.get_or_create(name=section_name)
+                        section_cache[section_name] = section_obj
+
+                fuel_name = str(row["fuel"]).strip()
+                fuel_obj = fuel_cache.get(fuel_name)
+                if fuel_obj is None:
+                    fuel_obj, _ = Fuel.objects.get_or_create(name=fuel_name)
+                    fuel_cache[fuel_name] = fuel_obj
+
+                vehicle_name = str(row["vehicle"]).strip()
+                vehicle_obj = vehicle_cache.get(vehicle_name)
+                if vehicle_obj is None:
+                    vehicle_obj, _ = Vehicle.objects.get_or_create(name=vehicle_name)
+                    vehicle_cache[vehicle_name] = vehicle_obj
+
+                rec = PmmRecord(
+                    batch=batch,
+                    section=section_obj,
+                    fuel=fuel_obj,
+                    vehicle=vehicle_obj,
+                    fact_qty=to_decimal(row.get("fact_qty")),
+                    fact_amount=to_decimal(row.get("fact_amount")),
+                    plan_qty=to_decimal(row.get("plan_qty")),
+                    plan_amount=to_decimal(row.get("plan_amount")),
+                    price=to_decimal(row.get("price")),
+                    delta=to_decimal(row.get("delta")),
+                )
+                records.append(rec)
+                imported += 1
+
+            except Exception:
+                errors += 1
+
+        PmmRecord.objects.bulk_create(records, batch_size=1000)
+
+        batch.imported_rows = imported
+        batch.errors = errors
+        batch.save(update_fields=["imported_rows", "errors"])
+
+        self.stdout.write(self.style.SUCCESS(f"Imported rows: {imported}, errors: {errors}"))
+        self.stdout.write(self.style.SUCCESS(f"Batch id: {batch.id}"))

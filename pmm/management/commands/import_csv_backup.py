@@ -90,198 +90,89 @@ def _has_period(s: str) -> bool:
     s = s.lower()
     return ("период" in s) or ("період" in s) or ("перiод" in s)
 
-def _parse_1c_account_report_to_pmm_df(path: str) -> pd.DataFrame:
-    text = _read_text_head(path, max_chars=200000)
 
-    sep = ";" if text.count(";") >= text.count(",") else ","
-
+def _read_1c_report_as_pmm_df(csv_path: str) -> pd.DataFrame:
+    """
+    Read a 1C account report and convert it into PMM-like dataframe
+    with columns:
+      section, fuel, vehicle, fact_qty, fact_amount, plan_qty, plan_amount, price, delta
+    """
+    raw = _read_bytes(csv_path)
+    text = _decode_1c_text(raw)
     lines = text.splitlines()
-    header_i = _find_header_row_1c(lines)
-    if header_i is None:
-        raise ValueError("Не найден заголовок таблицы (строка с 'Період/Период;Документ;...;Дебет;Кредит').")
 
-    df = None
-    last_err = None
-
-    # Пробуємо декілька кодировок та перевіряем, що колонки реально нормальні
-    for enc in ["utf-8-sig", "utf-8", "cp1251", "windows-1251"]:
-        try:
-            cand = pd.read_csv(
-                path,
-                sep=sep,
-                encoding=enc,
-                engine="python",
-                skiprows=header_i,
-            )
-
-            cand_cols = [str(c).replace("\ufeff", "").strip().lower() for c in cand.columns]
-
-            has_debit = any("дебет" in c for c in cand_cols)
-            has_credit = any("кредит" in c for c in cand_cols)
-
-            if not (has_debit and has_credit):
-                continue
-
-            df = cand
+    # Find header line (Period + Debit + Credit)
+    header_line = None
+    for i, line in enumerate(lines):
+        low = line.lower().replace("\ufeff", "").strip()
+        if _has_period(low) and ("дебет" in low) and ("кредит" in low):
+            header_line = i
             break
 
-        except Exception as e:
-            last_err = e
+    if header_line is None:
+        head30 = "\n".join(lines[:30])
+        raise ValueError(
+            "Не найдена строка заголовка 1C (Період/Период + Дебет + Кредит).\n"
+            f"Первые 30 строк файла:\n{head30}"
+        )
 
-    if df is None:
-        raise ValueError("Не вдалось прочитати таблицю 1С: заголовок не знайдено, або колонки не разпізнані (Дебет/Кредит).")
+    # Read table from header onward
+    data_text = "\n".join(lines[header_line:])
+    df = pd.read_csv(StringIO(data_text), sep=";", engine="python", dtype=str)
+    df.columns = [str(c).strip().replace("\ufeff", "") for c in df.columns]
+    cols_l = [c.lower() for c in df.columns]
 
-    df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
-    cols_l = [c.lower().replace("\ufeff", "").strip() for c in df.columns]
-
-    def find_col_contains(*needles):
-        needles = [n.lower() for n in needles]
+    def find_col_contains(*needles: str) -> str | None:
+        needles_l = [n.lower() for n in needles]
         for orig, low in zip(df.columns, cols_l):
-            if any(n in low for n in needles):
+            if any(n in low for n in needles_l):
                 return orig
         return None
 
-    col_period = find_col_contains("період", "период")
-    col_debit = find_col_contains("дебет")
-    col_credit = find_col_contains("кредит")
     col_an_dt = find_col_contains("аналітика дт", "аналитика дт")
     col_an_kt = find_col_contains("аналітика кт", "аналитика кт")
-    col_doc = find_col_contains("документ")
+    col_debit = find_col_contains("дебет")
+    col_credit = find_col_contains("кредит")
 
-    if not col_debit or not col_credit:
-        raise ValueError(f"У звіті нема колонок 'Дебет'/'Кредит'. Колонки: {list(df.columns)}")
+    if (col_debit is None) or (col_credit is None):
+        raise ValueError(f"Не знайшов колонки Дебет/Кредит. Колонки: {list(df.columns)}")
 
     def to_num(x):
-        if pd.isna(x):
+        if x is None or (isinstance(x, float) and pd.isna(x)):
             return None
-        s = str(x).strip().replace(" ", "").replace("\xa0", "").replace(",", ".")
+        s = str(x).strip()
         if s == "" or s.lower() in ("nan", "none"):
             return None
+        s = s.replace("\xa0", " ").replace(" ", "").replace(",", ".")
         try:
             return float(s)
         except Exception:
             return None
 
-    def extract_fuel(text):
-        if pd.isna(text):
-            return ""
-
-        s = str(text).strip().lower()
-
-        fuel_patterns = [
-            ("бензин а-95", "Бензин А-95"),
-            ("бензин а95", "Бензин А-95"),
-            ("бензин а-92", "Бензин А-92"),
-            ("бензин а92", "Бензин А-92"),
-            ("диз", "Дизельне пальне"),
-            ("газ", "Газ скраплений"),
-            ("антифриз", "Антифриз"),
-            ("тосол", "Тосол"),
-            ("мастило", "Мастило"),
-            ("масло", "Мастило"),
-            ("олива", "Олива"),
-            ("аерозоль", "Аерозоль мастило"),
-            ("паливо", "Паливо"),
-        ]
-
-        for pattern, normalized in fuel_patterns:
-            if pattern in s:
-                return normalized
-
-        return ""
-
-
-    def extract_vehicle(text):
-        if pd.isna(text):
-            return "N/A"
-
-        s = str(text).strip()
-
-        vehicle_keywords = [
-            "УАЗ", "ГАЗ", "ВАЗ", "ЗІЛ", "ЗИЛ", "PEUGEOT", "FIAT",
-            "FORD", "RENAULT", "MERCEDES", "VOLKSWAGEN",
-            "трактор", "екскаватор", "генератор", "електрогенератор",
-            "Т-16", "JCB", "MAN", "DAF", "IVECO"
-        ]
-
-        s_upper = s.upper()
-        for keyword in vehicle_keywords:
-            if keyword.upper() in s_upper:
-                return s
-
-        return "N/A"
-
-
-    def extract_section(text):
-        if pd.isna(text):
-            return ""
-
-        s = str(text).strip().lower()
-
-        if "загальновиробнич" in s:
-            return "Загальновиробничі витрати"
-        if "прямі матеріальні" in s or "прямые материальные" in s:
-            return "Прямі матеріальні затрати"
-        if "водовідведення" in s:
-            return "Водовідведення"
-        if "водопостач" in s:
-            return "Водопостачання"
-
-        return str(text).strip()
-
-
-    def extract_amount(row):
-        d = to_num(row[col_debit]) if col_debit else None
-        c = to_num(row[col_credit]) if col_credit else None
-
-        candidates = []
-
-        if d is not None and d > 0 and d not in (91, 203, 231, 901):
-            candidates.append(d)
-
-        if c is not None and c > 0 and c not in (91, 203, 231, 901):
-            candidates.append(c)
-
-        if not candidates:
-            return 0
-
-        return max(candidates)
-
     out = pd.DataFrame()
+    # ВАЖЛИВО: fillna ДО astype(str), інакше NaN стає строкою "nan".
+    out["section"] = df[col_an_dt].fillna("").astype(str).str.strip() if col_an_dt else ""
+    out["fuel"] = df[col_an_kt].fillna("").astype(str).str.strip() if col_an_kt else ""
 
-    raw_section = df[col_an_dt].fillna("").astype(str).str.strip() if col_an_dt else pd.Series([""] * len(df))
-    raw_fuel = df[col_an_kt].fillna("").astype(str).str.strip() if col_an_kt else pd.Series([""] * len(df))
-    raw_doc = df[col_doc].fillna("").astype(str).str.strip() if col_doc else pd.Series([""] * len(df))
+    # Знімаємо типові сміттєві строкові значення
+    out["section"] = out["section"].replace(to_replace=r"^\s*(nan|none)\s*$", value="", regex=True)
+    out["fuel"] = out["fuel"].replace(to_replace=r"^\s*(nan|none)\s*$", value="", regex=True)
 
-    out["section"] = raw_section.apply(extract_section)
-    out["fuel"] = raw_fuel.apply(extract_fuel)
-    out["vehicle"] = raw_section.apply(extract_vehicle)
+    # vehicle поки нема через 1С-шного звіту, залишаємо порожнім
+    out["vehicle"] = ""
 
-    # якщо fuel не знашли в Аналітика Кт, пробуємо найти у документі
-    mask_empty_fuel = out["fuel"] == ""
-    out.loc[mask_empty_fuel, "fuel"] = raw_doc[mask_empty_fuel].apply(extract_fuel)
+    # Map 1C debit/credit into PMM numeric fields (adjust later if you want different meaning)
+    out["fact_qty"] = df[col_debit].map(to_num)
+    out["fact_amount"] = df[col_credit].map(to_num)
 
-    # якщо vehicle не знашли в Аналітика Дт, пробуємо знайти у документі
-    mask_na_vehicle = out["vehicle"] == "N/A"
-    out.loc[mask_na_vehicle, "vehicle"] = raw_doc[mask_na_vehicle].apply(extract_vehicle)
+    out["plan_qty"] = None
+    out["plan_amount"] = None
+    out["price"] = None
+    out["delta"] = None
 
-    out["fact_qty"] = 0
-    out["fact_amount"] = df.apply(extract_amount, axis=1)
-
-    out["plan_qty"] = 0
-    out["plan_amount"] = 0
-    out["price"] = 0
-    out["delta"] = out["fact_amount"] 
-
-    if col_period:
-        out["source_date"] = df[col_period].fillna("").astype(str).str.strip()
-
-    # викидаємо строки без топлива та без суми
-    out = out[(out["fuel"] != "") & (out["fact_amount"].fillna(0) > 0)]
-
-    print("DEBUG COLUMNS:", list(out.columns))
-    print("DEBUG HEAD:")
-    print(out.head(20).to_string())
+    # Drop empty analytics rows and rows with both debit/credit == 0
+    out = out[(out["section"] != "") | (out["fuel"] != "")]
+    out = out[(out["fact_qty"].fillna(0) != 0) | (out["fact_amount"].fillna(0) != 0)]
 
     return out
 
@@ -308,7 +199,7 @@ class Command(BaseCommand):
 
         # 2) read dataframe
         if source_type == "1C":
-            df = _parse_1c_account_report_to_pmm_df(str(csv_path))
+            df = _read_1c_report_as_pmm_df(str(csv_path))
         else:
             df = None
             last_err = None
